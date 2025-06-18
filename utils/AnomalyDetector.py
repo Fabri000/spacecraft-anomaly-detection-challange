@@ -35,90 +35,69 @@ class AnomalyDetector:
     def estimate_scores(self, telemetries_errors:dict):
         scores = {}
         for telemetry in tqdm(telemetries_errors.keys()):
-
             with torch.no_grad():
-                scores[telemetry] = self.single_telemetry_score_estimation(telemetries_errors[telemetry])
+                scores[telemetry] = torch.sigmoid(self.single_telemetry_score_estimation(telemetries_errors[telemetry]))
             
-            del errors
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             gc.collect()
         
         return scores
 
+    def calculate_epsilon(self, means:torch.tensor, stds:torch.tensor ,z:int=3):
+        return means + z * stds
 
     def single_telemetry_score_estimation(self, serie:torch.tensor ,h:int=64):
         scores = []
-        for t in range(serie.shape[1]):
-            start_idx = max(0, t - h)
-            end_idx = t + 1
-            window = serie[:, start_idx:end_idx].flatten()
-            epsilon = 0
+        padded_serie = torch.cat([torch.zeros(serie.shape[0],h-1), serie], dim=1)
+        windows = padded_serie.unfold(dimension=1, size=h, step=1)
+        
+        means = torch.mean(windows,dim=2).squeeze(0)
+        stds = torch.std(windows,dim=2).squeeze(0)
 
-            if window.numel() == 1:
-                mean = window[0].item()
-                std = 0
-            else:
-                mean = torch.mean(window).item()
-                std = torch.std(window).item()
-            
-            epsilon = self.calculate_epsilon(mean,std)
-            
-            scores.append((torch.max(window).item() - epsilon) / (mean + std))
+        epsilons = self.calculate_vectorized_epsilon(windows, means,stds)
 
-            if t % 100 == 0:
-                del window
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                gc.collect()
+        denominators = means + stds
+        denominators = torch.where(denominators == 0, torch.tensor(1e-8), denominators)
+
+        scores = (torch.max(windows,dim=2)[0].squeeze(0) - epsilons) / denominators    
 
         return scores
     
-    
-
-    def calculate_epsilon(self, mean:float,std:float,z:int=5):
-        return mean + z * std
-
-    def calculate_approximate_epsilon(self, sequence:torch.tensor, mean:float, std:float , step:float=1e-2, iters:int=15):
+    def calculate_vectorized_epsilon(self,windows:torch.tensor, means:torch.tensor, stds:torch.tensor, init_percentile:float = 95.0, iters: int = 15,step: float = 1e-2):
         
-        best_epsilon = 1
-        best_value = 0
-
-        epsilon =  np.random.uniform(0,1)
-        value = 0
+        epsilons = torch.quantile(windows, init_percentile / 100.0, dim=2)
+        best_values = torch.zeros(epsilons.shape[0],epsilons.shape[1])
 
         for _ in range(iters):
-            candidate_epsilon = np.clip(epsilon + np.random.uniform(-step,step), 0, 1)
+            steps = torch.rand(epsilons.shape[0],epsilons.shape[1]) * (-step) + step
+            candidate_epsilons = epsilons + steps
 
-            normal = sequence < candidate_epsilon
+            normal_mask = windows < candidate_epsilons.unsqueeze(-1)
+            normal_samples = torch.where(normal_mask, windows,torch.zeros_like(windows))
+            
+            delta_means = means - torch.mean(normal_samples,dim=2)
+            delta_stds = stds - torch.std(normal_samples,dim=2)
 
-            E_seq = self.calculate_continouse_seq(sequence,~normal)
+            E_seq = self.efficient_calculate_continouse_seqs(windows, ~normal_mask)
 
-            c_e_a = sequence[normal]
-            delta_mean = mean - torch.mean(c_e_a)
-            delta_std = 0
-            if c_e_a.shape[0] <= 1:
-                delta_std = std
-            else:
-                delta_std = std - torch.std(c_e_a)
+            tmp_values = ((delta_means / means) + (delta_stds / stds)) / (torch.sum(~normal_mask) + E_seq ** 2)
 
-            tmp_value = ((delta_mean / mean) + (delta_std / std)) / (torch.sum(~normal)+ E_seq ** 2)
+            improved_mask  = tmp_values >= best_values
+            best_values = torch.where(improved_mask, tmp_values, best_values)
+            epsilons = torch.where(improved_mask, candidate_epsilons, epsilons)
 
-            if tmp_value > value:
-                value = tmp_value
-                epsilon = candidate_epsilon
+        return epsilons
 
-            if tmp_value > best_value:
-                best_value = value
-                best_epsilon  = epsilon
-        
-        return best_epsilon
+    def efficient_calculate_continouse_seqs(self,windows:torch.tensor,anomaly_masks:torch.tensor):
+        num_windows = windows.shape[1]
+        padded = torch.cat([
+            torch.zeros(num_windows, 1, dtype=torch.bool),  # Left padding
+            anomaly_masks.squeeze(0),
+            torch.zeros(num_windows, 1, dtype=torch.bool)   # Right padding
+        ], dim=1)
 
+        diff = padded[:, 1:].int() - padded[:, :-1].int()
+        sequence_starts = (diff == 1).sum(dim=1)
 
-    def calculate_continouse_seq(self,sequence,anomaly):
-        sequences = []
-        print(anomaly)
-        for is_anomaly, group in groupby(zip(anomaly, sequence ), key=lambda x: x[1]):
-            if is_anomaly:
-                sequences.append(list(group))
-
-        return len(sequences)
+        return sequence_starts
