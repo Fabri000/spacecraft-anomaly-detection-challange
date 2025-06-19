@@ -62,7 +62,7 @@ class AnomalyScoreEstimator:
 
         return scores
     
-    def calculate_vectorized_epsilon(self,windows:torch.tensor, means:torch.tensor, stds:torch.tensor, init_percentile:float = 95.0, iters: int = 15,step: float = 1e-2):
+    def calculate_vectorized_epsilon(self,windows:torch.tensor, means:torch.tensor, stds:torch.tensor, init_percentile:float = 95.0, iters: int = 50,step: float = 5e-2):
         
         epsilons = torch.quantile(windows, init_percentile / 100.0, dim=2)
         best_values = torch.zeros(epsilons.shape[0],epsilons.shape[1])
